@@ -70,8 +70,6 @@ func loadAwsSecrets() (map[string]interface{}, error) {
 		}
 	})
 
-	fmt.Println("AWS secrets loaded: ", awsSecrets)
-
 	return awsSecrets, nil
 }
 
