@@ -2,6 +2,7 @@ package goenvars
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sync"
@@ -14,7 +15,7 @@ import (
 
 var loadEnvOnce sync.Once
 var loadAwsSecretsOnce sync.Once
-var awsSecrets string
+var awsSecrets map[string]interface{}
 
 func loadVars() {
 	loadEnvOnce.Do(func() {
@@ -25,7 +26,7 @@ func loadVars() {
 	})
 }
 
-func loadAwsSecrets() string {
+func loadAwsSecrets() map[string]interface{} {
 	loadAwsSecretsOnce.Do(func() {
 		secretName := GetEnv("AWS_SECRET_NAME", "")
 		region := GetEnv("AWS_REGION", "")
@@ -48,8 +49,14 @@ func loadAwsSecrets() string {
 			return
 		}
 
-		awsSecrets = *result.SecretString
 		fmt.Println("Secret value: ", awsSecrets)
+
+		err = json.Unmarshal([]byte(*result.SecretString), &awsSecrets)
+
+		if err != nil {
+			fmt.Println("Error unmarshalling secret value: ", err)
+			return
+		}
 	})
 
 	return awsSecrets
@@ -71,6 +78,10 @@ func GetEnv(key string, defaultValue string) string {
 
 	if value != "" {
 		return value
+	} else if awsSecrets != nil {
+		if awsValue, ok := awsSecrets[key]; ok {
+			return fmt.Sprintf("%v", awsValue)
+		}
 	}
 
 	return defaultValue
