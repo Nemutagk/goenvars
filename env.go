@@ -13,6 +13,8 @@ import (
 )
 
 var loadEnvOnce sync.Once
+var loadAwsSecretsOnce sync.Once
+var awsSecrets string
 
 func loadVars() {
 	loadEnvOnce.Do(func() {
@@ -23,34 +25,37 @@ func loadVars() {
 	})
 }
 
-func loadAwsSecrets() {
-	secretName := GetEnv("AWS_SECRET_NAME", "")
-	region := GetEnv("AWS_REGION", "")
+func loadAwsSecrets() string {
+	loadAwsSecretsOnce.Do(func() {
+		secretName := GetEnv("AWS_SECRET_NAME", "")
+		region := GetEnv("AWS_REGION", "")
 
-	config, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
-	if err != nil {
-		fmt.Println("Error loading AWS config: ", err)
-		return
-	}
+		config, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+		if err != nil {
+			fmt.Println("Error loading AWS config: ", err)
+			return
+		}
 
-	svc := secretsmanager.NewFromConfig(config)
-	input := &secretsmanager.GetSecretValueInput{
-		SecretId:     aws.String(secretName),
-		VersionStage: aws.String("AWSCURRENT"),
-	}
+		svc := secretsmanager.NewFromConfig(config)
+		input := &secretsmanager.GetSecretValueInput{
+			SecretId:     aws.String(secretName),
+			VersionStage: aws.String("AWSCURRENT"),
+		}
 
-	result, err := svc.GetSecretValue(context.TODO(), input)
-	if err != nil {
-		fmt.Println("Error getting secret value: ", err)
-		return
-	}
+		result, err := svc.GetSecretValue(context.TODO(), input)
+		if err != nil {
+			fmt.Println("Error getting secret value: ", err)
+			return
+		}
 
-	var secretString string = *result.SecretString
-	fmt.Println("Secret value: ", secretString)
+		awsSecrets = *result.SecretString
+		fmt.Println("Secret value: ", awsSecrets)
+	})
+
+	return awsSecrets
 }
 
 func GetEnv(key string, defaultValue string) string {
-	loadVars()
 	app_env := os.Getenv("APP_ENV")
 	if app_env == "" {
 		app_env = "local"
@@ -58,6 +63,8 @@ func GetEnv(key string, defaultValue string) string {
 
 	if app_env != "local" {
 		loadAwsSecrets()
+	} else {
+		loadVars()
 	}
 
 	value := os.Getenv(key)
