@@ -27,22 +27,26 @@ func loadVars() {
 }
 
 func loadAwsSecrets() map[string]interface{} {
+	fmt.Println("Loading AWS secrets...")
 	loadAwsSecretsOnce.Do(func() {
 		secretName := GetEnv("AWS_SECRET_NAME", "")
 		region := GetEnv("AWS_REGION", "")
 
+		fmt.Println("create config with region: ", region)
 		config, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
 		if err != nil {
 			fmt.Println("Error loading AWS config: ", err)
 			return
 		}
 
+		fmt.Println("create secrets manager client")
 		svc := secretsmanager.NewFromConfig(config)
 		input := &secretsmanager.GetSecretValueInput{
 			SecretId:     aws.String(secretName),
 			VersionStage: aws.String("AWSCURRENT"),
 		}
 
+		fmt.Println("get secret value")
 		result, err := svc.GetSecretValue(context.TODO(), input)
 		if err != nil {
 			fmt.Println("Error getting secret value: ", err)
@@ -62,17 +66,22 @@ func loadAwsSecrets() map[string]interface{} {
 	return awsSecrets
 }
 
-func GetEnv(key string, defaultValue string) string {
+func LoadEnvVars() {
+	fmt.Println("Loading environment variables...")
 	app_env := os.Getenv("APP_ENV")
 	if app_env == "" {
 		app_env = "local"
 	}
 
-	loadVars()
+	fmt.Println("APP_ENV: ", app_env)
 
-	if app_env != "local" {
-		loadAwsSecrets()
+	if app_env == "local" {
+		loadVars()
 	}
+}
+
+func GetEnv(key string, defaultValue string) string {
+	LoadEnvVars()
 
 	value := os.Getenv(key)
 
