@@ -68,10 +68,10 @@ func GetEnv(key string, defaultValue string) string {
 		app_env = "local"
 	}
 
+	loadVars()
+
 	if app_env != "local" {
 		loadAwsSecrets()
-	} else {
-		loadVars()
 	}
 
 	value := os.Getenv(key)
