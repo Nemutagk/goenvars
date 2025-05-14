@@ -26,11 +26,17 @@ func loadVars() {
 	})
 }
 
-func loadAwsSecrets() map[string]interface{} {
+func loadAwsSecrets() (map[string]interface{}, error) {
 	fmt.Println("Loading AWS secrets...")
 	loadAwsSecretsOnce.Do(func() {
 		secretName := GetEnv("AWS_SECRET_NAME", "")
 		region := GetEnv("AWS_REGION", "")
+
+		if secretName == "" || region == "" {
+			fmt.Println("AWS_SECRET_NAME or AWS_REGION not set in environment variables")
+			awsSecrets = nil
+			return
+		}
 
 		fmt.Println("create config with region: ", region)
 		config, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
@@ -46,10 +52,10 @@ func loadAwsSecrets() map[string]interface{} {
 			VersionStage: aws.String("AWSCURRENT"),
 		}
 
-		fmt.Println("get secret value")
 		result, err := svc.GetSecretValue(context.TODO(), input)
 		if err != nil {
 			fmt.Println("Error getting secret value: ", err)
+			awsSecrets = nil
 			return
 		}
 
@@ -59,14 +65,17 @@ func loadAwsSecrets() map[string]interface{} {
 
 		if err != nil {
 			fmt.Println("Error unmarshalling secret value: ", err)
+			awsSecrets = nil
 			return
 		}
 	})
 
-	return awsSecrets
+	fmt.Println("AWS secrets loaded: ", awsSecrets)
+
+	return awsSecrets, nil
 }
 
-func LoadEnvVars() {
+func LoadEnvVars() (bool, error) {
 	fmt.Println("Loading environment variables...")
 	app_env := os.Getenv("APP_ENV")
 	if app_env == "" {
@@ -75,13 +84,20 @@ func LoadEnvVars() {
 
 	fmt.Println("APP_ENV: ", app_env)
 
-	if app_env == "local" {
+	if app_env != "local" {
+		if _, err := loadAwsSecrets(); err != nil {
+			fmt.Println("Error loading AWS secrets: ", err)
+			return false, err
+		}
+	} else {
 		loadVars()
 	}
+
+	return true, nil
 }
 
 func GetEnv(key string, defaultValue string) string {
-	LoadEnvVars()
+	// LoadEnvVars()
 
 	value := os.Getenv(key)
 
@@ -89,7 +105,7 @@ func GetEnv(key string, defaultValue string) string {
 		return value
 	} else if awsSecrets != nil {
 		if awsValue, ok := awsSecrets[key]; ok {
-			return fmt.Sprintf("%v", awsValue)
+			return awsValue.(string)
 		}
 	}
 
