@@ -13,6 +13,7 @@ import (
 	"github.com/joho/godotenv"
 )
 
+var loadAllVarsOnce sync.Once
 var loadEnvOnce sync.Once
 var loadAwsSecretsOnce sync.Once
 var awsSecrets map[string]interface{}
@@ -20,7 +21,7 @@ var awsSecrets map[string]interface{}
 func loadVars() {
 	loadEnvOnce.Do(func() {
 		fmt.Println("Loading environment variables...")
-		if err := godotenv.Overload(); err != nil {
+		if err := godotenv.Load(); err != nil {
 			fmt.Println("Error loading .env file: ", err)
 		}
 	})
@@ -74,28 +75,30 @@ func loadAwsSecrets() (map[string]interface{}, error) {
 }
 
 func LoadEnvVars() (bool, error) {
-	fmt.Println("Loading environment variables...")
-	app_env := os.Getenv("APP_ENV")
-	if app_env == "" {
-		app_env = "local"
-	}
-
-	fmt.Println("APP_ENV: ", app_env)
-
-	if app_env != "local" {
-		if _, err := loadAwsSecrets(); err != nil {
-			fmt.Println("Error loading AWS secrets: ", err)
-			return false, err
+	loadAllVarsOnce.Do(func() {
+		fmt.Println("Loading environment variables...")
+		app_env := os.Getenv("APP_ENV")
+		if app_env == "" {
+			app_env = "local"
 		}
-	} else {
-		loadVars()
-	}
+
+		fmt.Println("APP_ENV: ", app_env)
+
+		if app_env != "local" {
+			if _, err := loadAwsSecrets(); err != nil {
+				fmt.Println("Error loading AWS secrets: ", err)
+				return
+			}
+		} else {
+			loadVars()
+		}
+	})
 
 	return true, nil
 }
 
 func GetEnv(key string, defaultValue string) string {
-	// LoadEnvVars()
+	LoadEnvVars()
 
 	value := os.Getenv(key)
 
