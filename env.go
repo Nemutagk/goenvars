@@ -20,33 +20,35 @@ var awsSecrets map[string]interface{}
 
 func loadVars() {
 	loadEnvOnce.Do(func() {
-		fmt.Println("Loading environment variables...")
+		log.Println("Loading environment variables...")
 		if err := godotenv.Load(); err != nil {
-			fmt.Println("Error loading .env file: ", err)
+			log.Println("Error loading .env file: ", err)
 		}
 	})
 }
 
 func loadAwsSecrets() (map[string]interface{}, error) {
-	fmt.Println("Loading AWS secrets...")
+	log.Println("Loading AWS secrets...")
 	loadAwsSecretsOnce.Do(func() {
 		secretName := GetEnv("AWS_SECRET_NAME", "")
+		log.Println("AWS_SECRET_NAME: ", secretName)
 		region := GetEnv("AWS_REGION", "")
+		log.Println("AWS_REGION: ", region)
 
 		if secretName == "" || region == "" {
-			fmt.Println("AWS_SECRET_NAME or AWS_REGION not set in environment variables")
+			log.Println("AWS_SECRET_NAME or AWS_REGION not set in environment variables")
 			awsSecrets = nil
 			return
 		}
 
-		fmt.Println("create config with region: ", region)
+		log.Println("create config with region: ", region)
 		config, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
 		if err != nil {
-			fmt.Println("Error loading AWS config: ", err)
+			log.Println("Error loading AWS config: ", err)
 			return
 		}
 
-		fmt.Println("create secrets manager client")
+		log.Println("create secrets manager client")
 		svc := secretsmanager.NewFromConfig(config)
 		input := &secretsmanager.GetSecretValueInput{
 			SecretId:     aws.String(secretName),
@@ -55,17 +57,17 @@ func loadAwsSecrets() (map[string]interface{}, error) {
 
 		result, err := svc.GetSecretValue(context.TODO(), input)
 		if err != nil {
-			fmt.Println("Error getting secret value: ", err)
+			log.Println("Error getting secret value: ", err)
 			awsSecrets = nil
 			return
 		}
 
-		fmt.Println("Secret value: ", awsSecrets)
+		log.Println("Secret value: ", awsSecrets)
 
 		err = json.Unmarshal([]byte(*result.SecretString), &awsSecrets)
 
 		if err != nil {
-			fmt.Println("Error unmarshalling secret value: ", err)
+			log.Println("Error unmarshalling secret value: ", err)
 			awsSecrets = nil
 			return
 		}
@@ -76,17 +78,17 @@ func loadAwsSecrets() (map[string]interface{}, error) {
 
 func LoadEnvVars() (bool, error) {
 	loadAllVarsOnce.Do(func() {
-		fmt.Println("Loading environment variables...")
+		log.Println("Loading environment variables...")
 		app_env := os.Getenv("APP_ENV")
 		if app_env == "" {
 			app_env = "local"
 		}
 
-		fmt.Println("APP_ENV: ", app_env)
+		log.Println("APP_ENV: ", app_env)
 
 		if app_env != "local" {
 			if _, err := loadAwsSecrets(); err != nil {
-				fmt.Println("Error loading AWS secrets: ", err)
+				log.Println("Error loading AWS secrets: ", err)
 				return
 			}
 		} else {
