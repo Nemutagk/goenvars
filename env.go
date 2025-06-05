@@ -3,7 +3,7 @@ package goenvars
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"log"
 	"os"
 	"sync"
 
@@ -30,10 +30,8 @@ func loadVars() {
 func loadAwsSecrets() (map[string]interface{}, error) {
 	log.Println("Loading AWS secrets...")
 	loadAwsSecretsOnce.Do(func() {
-		secretName := GetEnv("AWS_SECRET_NAME", "")
-		log.Println("AWS_SECRET_NAME: ", secretName)
-		region := GetEnv("AWS_REGION", "")
-		log.Println("AWS_REGION: ", region)
+		secretName := os.Getenv("AWS_SECRET_NAME")
+		region := os.Getenv("AWS_REGION")
 
 		if secretName == "" || region == "" {
 			log.Println("AWS_SECRET_NAME or AWS_REGION not set in environment variables")
@@ -41,14 +39,12 @@ func loadAwsSecrets() (map[string]interface{}, error) {
 			return
 		}
 
-		log.Println("create config with region: ", region)
 		config, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
 		if err != nil {
 			log.Println("Error loading AWS config: ", err)
 			return
 		}
 
-		log.Println("create secrets manager client")
 		svc := secretsmanager.NewFromConfig(config)
 		input := &secretsmanager.GetSecretValueInput{
 			SecretId:     aws.String(secretName),
@@ -61,8 +57,6 @@ func loadAwsSecrets() (map[string]interface{}, error) {
 			awsSecrets = nil
 			return
 		}
-
-		log.Println("Secret value: ", awsSecrets)
 
 		err = json.Unmarshal([]byte(*result.SecretString), &awsSecrets)
 
