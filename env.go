@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"strconv"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -103,6 +104,66 @@ func GetEnv(key string, defaultValue string) string {
 	} else if awsSecrets != nil {
 		if awsValue, ok := awsSecrets[key]; ok {
 			return awsValue.(string)
+		}
+	}
+
+	return defaultValue
+}
+
+func GetEnvBool(key string, defaultValue bool) bool {
+	LoadEnvVars()
+
+	value := os.Getenv(key)
+
+	if value != "" {
+		if boolValue, err := strconv.ParseBool(value); err == nil {
+			return boolValue
+		}
+	} else if awsSecrets != nil {
+		if awsValue, ok := awsSecrets[key]; ok {
+			if boolValue, err := strconv.ParseBool(awsValue.(string)); err == nil {
+				return boolValue
+			}
+		}
+	}
+
+	return defaultValue
+}
+
+func GetEnvInt(key string, defaultValue int) int {
+	LoadEnvVars()
+
+	value := os.Getenv(key)
+
+	if value != "" {
+		if intValue, err := strconv.Atoi(value); err == nil {
+			return intValue
+		}
+	} else if awsSecrets != nil {
+		if awsValue, ok := awsSecrets[key]; ok {
+			if intValue, err := strconv.Atoi(awsValue.(string)); err == nil {
+				return intValue
+			}
+		}
+	}
+
+	return defaultValue
+}
+
+func GetEnvFloat(key string, defaultValue float64) float64 {
+	LoadEnvVars()
+
+	value := os.Getenv(key)
+
+	if value != "" {
+		if floatValue, err := strconv.ParseFloat(value, 64); err == nil {
+			return floatValue
+		}
+	} else if awsSecrets != nil {
+		if awsValue, ok := awsSecrets[key]; ok {
+			if floatValue, err := strconv.ParseFloat(awsValue.(string), 64); err == nil {
+				return floatValue
+			}
 		}
 	}
 
