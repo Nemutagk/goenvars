@@ -16,10 +16,20 @@ import (
 	"github.com/joho/godotenv"
 )
 
-var loadEnvOnce sync.Once
-var mu sync.RWMutex
-var awsSecrets []map[string]any
-var awsSecretsLoaded map[string]string
+var (
+	loadEnvOnce      sync.Once
+	mu               sync.RWMutex
+	muLoad           sync.RWMutex
+	awsSecrets       = make([]map[string]any, 0)
+	awsSecretsLoaded = make(map[string]string)
+	preloadedVars    = make(map[string]any)
+	loaded           bool
+)
+
+type EnvDef struct {
+	Key  string
+	Type string
+}
 
 func loadVars() {
 	loadEnvOnce.Do(func() {
@@ -34,21 +44,13 @@ func loadVars() {
 }
 
 func LoadAwsSecret(secretName, region string) error {
-	if awsSecretsLoaded == nil {
-		awsSecretsLoaded = make(map[string]string)
-	}
-
-	if awsSecrets == nil {
-		awsSecrets = []map[string]any{} // Inicializar como slice vacío
-	}
+	mu.Lock()
+	defer mu.Unlock()
 
 	if secretName == "" || region == "" {
 		fmt.Println("secret_name o aws_region no definidos para cargar secretos")
 		return errors.New("secret_name o aws_region no definidos para cargar secretos")
 	}
-
-	mu.Lock()
-	defer mu.Unlock()
 
 	_, ok := awsSecretsLoaded[secretName]
 	if ok {
@@ -106,87 +108,169 @@ func LoadEnvVars() error {
 	return retErr
 }
 
-func GetEnv(key string, defaultValue string) string {
-	LoadEnvVars()
+func PreloadEnvVars(vars []EnvDef) {
+	muLoad.Lock()
+	defer muLoad.Unlock()
 
-	if v := os.Getenv(key); v != "" {
-		return v
+	if loaded {
+		return
 	}
-	awsValue := getAwsValue(key)
-	if awsValue != "" {
-		awsValueStr := fmt.Sprintf("%v", awsValue)
-		return awsValueStr
+
+	for _, def := range vars {
+		var rawvalue any
+		value := os.Getenv(def.Key)
+
+		if value == "" {
+			awsValue, exito := getAwsValue(def.Key)
+			if exito {
+				rawvalue = awsValue
+			} else {
+				continue
+			}
+		} else {
+			rawvalue = value
+		}
+
+		switch def.Type {
+		case "bool":
+			if vBool, ok := rawvalue.(bool); ok {
+				preloadedVars[def.Key] = vBool
+			} else {
+				if b, err := strconv.ParseBool(fmt.Sprintf("%v", rawvalue)); err == nil {
+					preloadedVars[def.Key] = b
+				}
+			}
+		case "int":
+			if vInt, ok := rawvalue.(int); ok {
+				preloadedVars[def.Key] = vInt
+			} else {
+				if n, err := strconv.Atoi(fmt.Sprintf("%v", rawvalue)); err == nil {
+					preloadedVars[def.Key] = n
+				}
+			}
+		case "float64":
+			if vFloat, ok := rawvalue.(float64); ok {
+				preloadedVars[def.Key] = vFloat
+			} else {
+				if f, err := strconv.ParseFloat(fmt.Sprintf("%v", rawvalue), 64); err == nil {
+					preloadedVars[def.Key] = f
+				}
+			}
+		default:
+			preloadedVars[def.Key] = rawvalue
+		}
 	}
-	return defaultValue
+	loaded = true
+}
+
+func Get[T any](key string, defaultValue T) T {
+	muLoad.RLock()
+
+	if val, exists := preloadedVars[key]; exists {
+		if v, ok := val.(T); ok {
+			muLoad.RUnlock()
+			return v
+		}
+	}
+
+	if loaded {
+		muLoad.RUnlock()
+		return defaultValue
+	}
+	muLoad.RUnlock()
+
+	muLoad.Lock()
+	defer muLoad.Unlock()
+
+	if val, exists := preloadedVars[key]; exists {
+		if v, ok := val.(T); ok {
+			return v
+		}
+	}
+
+	var rawvalue any
+	val := os.Getenv(key)
+	if val == "" {
+		awsValue, exito := getAwsValue(key)
+		if exito {
+			rawvalue = awsValue
+		} else {
+			preloadedVars[key] = defaultValue
+			return defaultValue
+		}
+	} else {
+		rawvalue = val
+	}
+
+	var parsed any
+	switch any(defaultValue).(type) {
+	case bool:
+		if vBool, ok := rawvalue.(bool); ok {
+			parsed = vBool
+		} else {
+			if b, err := strconv.ParseBool(fmt.Sprintf("%v", rawvalue)); err == nil {
+				parsed = b
+			} else {
+				parsed = defaultValue
+			}
+		}
+	case int:
+		if vInt, ok := rawvalue.(int); ok {
+			parsed = vInt
+		} else {
+			if n, err := strconv.Atoi(fmt.Sprintf("%v", rawvalue)); err == nil {
+				parsed = n
+			} else {
+				parsed = defaultValue
+			}
+		}
+	case float64:
+		if vFloat, ok := rawvalue.(float64); ok {
+			parsed = vFloat
+		} else {
+			if f, err := strconv.ParseFloat(fmt.Sprintf("%v", rawvalue), 64); err == nil {
+				parsed = f
+			} else {
+				parsed = defaultValue
+			}
+		}
+	default:
+		parsed = rawvalue
+	}
+
+	preloadedVars[key] = parsed
+
+	return parsed.(T)
+}
+
+func GetEnv(key string, defaultValue string) string {
+	return Get(key, defaultValue)
 }
 
 func GetEnvBool(key string, defaultValue bool) bool {
-	LoadEnvVars()
-
-	if v := os.Getenv(key); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
-		}
-	}
-	awsValue := getAwsValue(key)
-	if awsValue != "" {
-		awsValueStr := fmt.Sprintf("%v", awsValue)
-		if b, err := strconv.ParseBool(awsValueStr); err == nil {
-			return b
-		}
-	}
-
-	return defaultValue
+	return Get(key, defaultValue)
 }
 
 func GetEnvInt(key string, defaultValue int) int {
-	LoadEnvVars()
-
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	awsValue := getAwsValue(key)
-	if awsValue != "" {
-		awsValueStr := fmt.Sprintf("%v", awsValue)
-		if n, err := strconv.Atoi(awsValueStr); err == nil {
-			return n
-		}
-	}
-	return defaultValue
+	return Get(key, defaultValue)
 }
 
 func GetEnvFloat(key string, defaultValue float64) float64 {
-	LoadEnvVars()
-
-	if v := os.Getenv(key); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
-	}
-	awsValue := getAwsValue(key)
-	if awsValue != "" {
-		awsValueStr := fmt.Sprintf("%v", awsValue)
-		if f, err := strconv.ParseFloat(awsValueStr, 64); err == nil {
-			return f
-		}
-	}
-	return defaultValue
+	return Get(key, defaultValue)
 }
 
-func getAwsValue(key string) any {
+func getAwsValue(key string) (any, bool) {
 	mu.RLock()
 	defer mu.RUnlock()
 
 	if awsSecrets == nil {
-		return ""
+		return nil, false
 	}
 
 	for _, awsSecret := range awsSecrets {
 		if awsValue, ok := awsSecret[key]; ok {
-			return awsValue
+			return awsValue, true
 		}
 	}
-	return ""
+	return nil, false
 }
