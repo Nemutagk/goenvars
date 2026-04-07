@@ -173,10 +173,6 @@ func Get[T any](key string, defaultValue T) T {
 		}
 	}
 
-	if loaded {
-		muLoad.RUnlock()
-		return defaultValue
-	}
 	muLoad.RUnlock()
 
 	muLoad.Lock()
