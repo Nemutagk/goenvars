@@ -3,6 +3,7 @@ package goenvars
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -15,10 +16,10 @@ import (
 	"github.com/joho/godotenv"
 )
 
-var loadAllVarsOnce sync.Once
 var loadEnvOnce sync.Once
-var loadAwsSecretsOnce sync.Once
-var awsSecrets map[string]interface{}
+var mu sync.RWMutex
+var awsSecrets []map[string]any
+var awsSecretsLoaded map[string]string
 
 func loadVars() {
 	loadEnvOnce.Do(func() {
@@ -26,72 +27,83 @@ func loadVars() {
 			if os.IsNotExist(err) {
 				log.Printf("Warning: archivo .env no encontrado (%v)", err)
 			}
-			
+
 			log.Printf("Error cargando .env: %v", err)
 		}
 	})
 }
 
-func loadAwsSecrets() (map[string]interface{}, error) {
-	var loadErr error
-	loadAwsSecretsOnce.Do(func() {
-		log.Println("Loading AWS secrets...")
-		secretName := os.Getenv("AWS_SECRET_NAME")
-		region := os.Getenv("AWS_REGION")
+func LoadAwsSecret(secretName, region string) error {
+	if awsSecretsLoaded == nil {
+		awsSecretsLoaded = make(map[string]string)
+	}
 
-		if secretName == "" {
-			// No definido => no se cargan secretos
-			return
-		}
-		if region == "" {
-			loadErr = fmt.Errorf("AWS_REGION no definido para cargar secretos")
-			return
-		}
+	if awsSecrets == nil {
+		awsSecrets = []map[string]any{} // Inicializar como slice vacío
+	}
 
-		awsCfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
-		if err != nil {
-			loadErr = fmt.Errorf("cargando configuración AWS: %w", err)
-			return
-		}
+	if secretName == "" || region == "" {
+		fmt.Println("secret_name o aws_region no definidos para cargar secretos")
+		return errors.New("secret_name o aws_region no definidos para cargar secretos")
+	}
 
-		svc := secretsmanager.NewFromConfig(awsCfg)
-		input := &secretsmanager.GetSecretValueInput{
-			SecretId:     aws.String(secretName),
-			VersionStage: aws.String("AWSCURRENT"),
-		}
+	mu.Lock()
+	defer mu.Unlock()
 
-		result, err := svc.GetSecretValue(context.TODO(), input)
-		if err != nil {
-			loadErr = fmt.Errorf("obteniendo secreto: %w", err)
-			return
-		}
+	_, ok := awsSecretsLoaded[secretName]
+	if ok {
+		fmt.Printf("secreto %s ya cargado, omitiendo\n", secretName)
+		return nil
+	}
 
-		if result.SecretString == nil {
-			loadErr = fmt.Errorf("SecretString vacío para %s", secretName)
-			return
-		}
+	awsCfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	if err != nil {
+		fmt.Printf("cargando configuración AWS: %v\n", err)
+		return err
+	}
 
-		if err := json.Unmarshal([]byte(*result.SecretString), &awsSecrets); err != nil {
-			loadErr = fmt.Errorf("unmarshal secreto: %w", err)
-			awsSecrets = nil
-			return
-		}
-	})
-	return awsSecrets, loadErr
+	svc := secretsmanager.NewFromConfig(awsCfg)
+	input := &secretsmanager.GetSecretValueInput{
+		SecretId:     aws.String(secretName),
+		VersionStage: aws.String("AWSCURRENT"),
+	}
+
+	result, err := svc.GetSecretValue(context.TODO(), input)
+	if err != nil {
+		fmt.Printf("obteniendo secreto: %v\n", err)
+		return err
+	}
+
+	if result.SecretString == nil {
+		fmt.Printf("SecretString vacío para %s\n", secretName)
+		return fmt.Errorf("SecretString vacío para %s", secretName)
+	}
+
+	var awsSecretTmp map[string]any
+	if err := json.Unmarshal([]byte(*result.SecretString), &awsSecretTmp); err != nil {
+		fmt.Printf("unmarshal secreto: %v\n", err)
+		return fmt.Errorf("unmarshal secreto: %w", err)
+	}
+
+	awsSecrets = append(awsSecrets, awsSecretTmp)
+	awsSecretsLoaded[secretName] = secretName
+
+	return nil
 }
 
-func LoadEnvVars() (bool, error) {
+func LoadEnvVars() error {
 	var retErr error
-	loadAllVarsOnce.Do(func() {
-		loadVars()
+	loadVars()
 
-		if os.Getenv("AWS_SECRET_NAME") != "" {
-			if _, err := loadAwsSecrets(); err != nil {
-				retErr = err
-			}
+	awsSecret := os.Getenv("AWS_SECRET_NAME")
+	awsRegion := os.Getenv("AWS_REGION")
+	if awsSecret != "" && awsRegion != "" {
+		if err := LoadAwsSecret(awsSecret, awsRegion); err != nil {
+			retErr = err
 		}
-	})
-	return retErr == nil, retErr
+	}
+
+	return retErr
 }
 
 func GetEnv(key string, defaultValue string) string {
@@ -100,14 +112,10 @@ func GetEnv(key string, defaultValue string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
-	if awsSecrets != nil {
-		if awsValue, ok := awsSecrets[key]; ok {
-			if s, ok2 := awsValue.(string); ok2 {
-				return s
-			}
-			// Fallback a representar como string genérico
-			return fmt.Sprint(awsValue)
-		}
+	awsValue := getAwsValue(key)
+	if awsValue != "" {
+		awsValueStr := fmt.Sprintf("%v", awsValue)
+		return awsValueStr
 	}
 	return defaultValue
 }
@@ -120,15 +128,14 @@ func GetEnvBool(key string, defaultValue bool) bool {
 			return b
 		}
 	}
-	if awsSecrets != nil {
-		if awsValue, ok := awsSecrets[key]; ok {
-			if s, ok2 := awsValue.(string); ok2 {
-				if b, err := strconv.ParseBool(s); err == nil {
-					return b
-				}
-			}
+	awsValue := getAwsValue(key)
+	if awsValue != "" {
+		awsValueStr := fmt.Sprintf("%v", awsValue)
+		if b, err := strconv.ParseBool(awsValueStr); err == nil {
+			return b
 		}
 	}
+
 	return defaultValue
 }
 
@@ -140,13 +147,11 @@ func GetEnvInt(key string, defaultValue int) int {
 			return n
 		}
 	}
-	if awsSecrets != nil {
-		if awsValue, ok := awsSecrets[key]; ok {
-			if s, ok2 := awsValue.(string); ok2 {
-				if n, err := strconv.Atoi(s); err == nil {
-					return n
-				}
-			}
+	awsValue := getAwsValue(key)
+	if awsValue != "" {
+		awsValueStr := fmt.Sprintf("%v", awsValue)
+		if n, err := strconv.Atoi(awsValueStr); err == nil {
+			return n
 		}
 	}
 	return defaultValue
@@ -160,14 +165,28 @@ func GetEnvFloat(key string, defaultValue float64) float64 {
 			return f
 		}
 	}
-	if awsSecrets != nil {
-		if awsValue, ok := awsSecrets[key]; ok {
-			if s, ok2 := awsValue.(string); ok2 {
-				if f, err := strconv.ParseFloat(s, 64); err == nil {
-					return f
-				}
-			}
+	awsValue := getAwsValue(key)
+	if awsValue != "" {
+		awsValueStr := fmt.Sprintf("%v", awsValue)
+		if f, err := strconv.ParseFloat(awsValueStr, 64); err == nil {
+			return f
 		}
 	}
 	return defaultValue
+}
+
+func getAwsValue(key string) any {
+	mu.RLock()
+	defer mu.RUnlock()
+
+	if awsSecrets == nil {
+		return ""
+	}
+
+	for _, awsSecret := range awsSecrets {
+		if awsValue, ok := awsSecret[key]; ok {
+			return awsValue
+		}
+	}
+	return ""
 }
