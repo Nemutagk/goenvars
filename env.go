@@ -31,9 +31,9 @@ type EnvDef struct {
 	Type string
 }
 
-func loadVars() {
+func loadVars(files ...string) {
 	loadEnvOnce.Do(func() {
-		if err := godotenv.Load(); err != nil {
+		if err := godotenv.Load(files...); err != nil {
 			if os.IsNotExist(err) {
 				log.Printf("Warning: archivo .env no encontrado (%v)", err)
 			}
@@ -93,9 +93,9 @@ func LoadAwsSecret(secretName, region string) error {
 	return nil
 }
 
-func LoadEnvVars() error {
+func LoadEnvVars(files ...string) error {
 	var retErr error
-	loadVars()
+	loadVars(files...)
 
 	awsSecret := os.Getenv("AWS_SECRET_NAME")
 	awsRegion := os.Getenv("AWS_REGION")
