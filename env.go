@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -17,13 +20,13 @@ import (
 )
 
 var (
-	loadEnvOnce      sync.Once
+	envMu            sync.Mutex
+	envLoaded        atomic.Bool // true tras el primer intento de cargar .env
 	mu               sync.RWMutex
 	muLoad           sync.RWMutex
 	awsSecrets       = make([]map[string]any, 0)
 	awsSecretsLoaded = make(map[string]string)
 	preloadedVars    = make(map[string]any)
-	loaded           bool
 )
 
 type EnvDef struct {
@@ -31,34 +34,58 @@ type EnvDef struct {
 	Type string
 }
 
-func loadVars(files ...string) {
-	loadEnvOnce.Do(func() {
-		if err := godotenv.Load(files...); err != nil {
-			if os.IsNotExist(err) {
-				log.Printf("Warning: archivo .env no encontrado (%v)", err)
-			}
+// loadVars carga .env una sola vez. Sin archivos: .env por defecto, y si falta solo avisa.
+// Con archivos explícitos: si ya hubo una carga previa devuelve error en vez de ignorarlos.
+func loadVars(files ...string) error {
+	if len(files) == 0 && envLoaded.Load() {
+		return nil // camino rápido de Get
+	}
 
-			log.Printf("Error cargando .env: %v", err)
+	envMu.Lock()
+	defer envMu.Unlock()
+
+	if envLoaded.Load() {
+		if len(files) > 0 {
+			return errors.New("goenvars: las variables ya se cargaron; LoadEnvVars con archivos debe llamarse antes de cualquier lectura")
 		}
-	})
+		return nil
+	}
+
+	err := godotenv.Load(files...)
+	if err != nil && len(files) > 0 {
+		return err // sin marcar como cargado: permite reintentar con otro archivo
+	}
+	envLoaded.Store(true)
+
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("Warning: archivo .env no encontrado (%v)", err)
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
+// Deprecated: usar el módulo goenvars/aws con AddSource.
 func LoadAwsSecret(secretName, region string) error {
-	mu.Lock()
-	defer mu.Unlock()
-
 	if secretName == "" || region == "" {
 		fmt.Println("secret_name o aws_region no definidos para cargar secretos")
 		return errors.New("secret_name o aws_region no definidos para cargar secretos")
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	mu.RLock()
 	_, ok := awsSecretsLoaded[secretName]
+	mu.RUnlock()
 	if ok {
 		fmt.Printf("secreto %s ya cargado, omitiendo\n", secretName)
 		return nil
 	}
 
-	awsCfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		fmt.Printf("cargando configuración AWS: %v\n", err)
 		return err
@@ -70,7 +97,7 @@ func LoadAwsSecret(secretName, region string) error {
 		VersionStage: aws.String("AWSCURRENT"),
 	}
 
-	result, err := svc.GetSecretValue(context.TODO(), input)
+	result, err := svc.GetSecretValue(ctx, input)
 	if err != nil {
 		fmt.Printf("obteniendo secreto: %v\n", err)
 		return err
@@ -87,156 +114,108 @@ func LoadAwsSecret(secretName, region string) error {
 		return fmt.Errorf("unmarshal secreto: %w", err)
 	}
 
+	mu.Lock()
 	awsSecrets = append(awsSecrets, awsSecretTmp)
 	awsSecretsLoaded[secretName] = secretName
+	mu.Unlock()
 
 	return nil
 }
 
 func LoadEnvVars(files ...string) error {
-	var retErr error
-	loadVars(files...)
+	if err := loadVars(files...); err != nil {
+		return err
+	}
 
 	awsSecret := os.Getenv("AWS_SECRET_NAME")
 	awsRegion := os.Getenv("AWS_REGION")
 	if awsSecret != "" && awsRegion != "" {
-		if err := LoadAwsSecret(awsSecret, awsRegion); err != nil {
-			retErr = err
-		}
+		return LoadAwsSecret(awsSecret, awsRegion)
 	}
+	return nil
+}
 
-	return retErr
+// Source es una fuente externa de variables (AWS, Vault, SSM...). Devuelve texto;
+// goenvars hace la conversión de tipo.
+//
+// Lookup debe ser rápido y no llamar a goenvars (Get/GetEnv...): carga los datos al
+// construir la fuente y aquí solo consulta. Si no, puede haber recursión infinita.
+type Source interface {
+	Lookup(key string) (string, bool)
+}
+
+var sources []Source // protegido por mu
+
+// AddSource registra una fuente; se consulta después del entorno, en orden de registro.
+// Llamarla antes de PreloadEnvVars.
+func AddSource(s Source) {
+	mu.Lock()
+	defer mu.Unlock()
+	sources = append(sources, s)
 }
 
 func PreloadEnvVars(vars []EnvDef) {
-	muLoad.Lock()
-	defer muLoad.Unlock()
-
-	if loaded {
-		return
+	if err := loadVars(); err != nil {
+		log.Printf("Error cargando .env: %v", err)
 	}
 
+	// Se resuelve fuera del candado: lookup ejecuta código de las fuentes (puede llamar a Get o tardar).
+	resultado := make(map[string]any, len(vars))
 	for _, def := range vars {
-		var rawvalue any
-		value := os.Getenv(def.Key)
-
-		if value == "" {
-			awsValue, exito := getAwsValue(def.Key)
-			if exito {
-				rawvalue = awsValue
-			} else {
-				continue
-			}
-		} else {
-			rawvalue = value
+		raw, found := lookup(def.Key)
+		if !found {
+			continue
 		}
 
+		var v any
+		var ok bool
 		switch def.Type {
 		case "bool":
-			if vBool, ok := rawvalue.(bool); ok {
-				preloadedVars[def.Key] = vBool
-			} else {
-				if b, err := strconv.ParseBool(fmt.Sprintf("%v", rawvalue)); err == nil {
-					preloadedVars[def.Key] = b
-				}
-			}
+			v, ok = parse(raw, false)
 		case "int":
-			if vInt, ok := rawvalue.(int); ok {
-				preloadedVars[def.Key] = vInt
-			} else {
-				if n, err := strconv.Atoi(fmt.Sprintf("%v", rawvalue)); err == nil {
-					preloadedVars[def.Key] = n
-				}
-			}
+			v, ok = parse(raw, 0)
 		case "float64":
-			if vFloat, ok := rawvalue.(float64); ok {
-				preloadedVars[def.Key] = vFloat
-			} else {
-				if f, err := strconv.ParseFloat(fmt.Sprintf("%v", rawvalue), 64); err == nil {
-					preloadedVars[def.Key] = f
-				}
-			}
+			v, ok = parse(raw, 0.0)
 		default:
-			preloadedVars[def.Key] = rawvalue
+			v, ok = parse(raw, "")
 		}
+		if !ok {
+			log.Printf("goenvars: %s no se pudo convertir a %q", def.Key, def.Type)
+			continue
+		}
+		resultado[def.Key] = v
 	}
-	loaded = true
+
+	muLoad.Lock()
+	for k, v := range resultado {
+		preloadedVars[k] = v
+	}
+	muLoad.Unlock()
 }
 
 func Get[T any](key string, defaultValue T) T {
+	if err := loadVars(); err != nil {
+		log.Printf("Error cargando .env: %v", err)
+	}
+
+	// Solo PreloadEnvVars escribe en este mapa, y es explícito.
 	muLoad.RLock()
-
-	if val, exists := preloadedVars[key]; exists {
-		if v, ok := val.(T); ok {
-			muLoad.RUnlock()
-			return v
-		}
-	}
-
+	val, exists := preloadedVars[key]
 	muLoad.RUnlock()
-
-	muLoad.Lock()
-	defer muLoad.Unlock()
-
-	if val, exists := preloadedVars[key]; exists {
+	if exists {
 		if v, ok := val.(T); ok {
 			return v
 		}
 	}
 
-	var rawvalue any
-	val := os.Getenv(key)
-	if val == "" {
-		awsValue, exito := getAwsValue(key)
-		if exito {
-			rawvalue = awsValue
-		} else {
-			preloadedVars[key] = defaultValue
-			return defaultValue
-		}
-	} else {
-		rawvalue = val
+	raw, found := lookup(key)
+	if !found {
+		return defaultValue
 	}
-
-	var parsed any
-	switch any(defaultValue).(type) {
-	case bool:
-		if vBool, ok := rawvalue.(bool); ok {
-			parsed = vBool
-		} else {
-			if b, err := strconv.ParseBool(fmt.Sprintf("%v", rawvalue)); err == nil {
-				parsed = b
-			} else {
-				parsed = defaultValue
-			}
-		}
-	case int:
-		if vInt, ok := rawvalue.(int); ok {
-			parsed = vInt
-		} else {
-			if n, err := strconv.Atoi(fmt.Sprintf("%v", rawvalue)); err == nil {
-				parsed = n
-			} else {
-				parsed = defaultValue
-			}
-		}
-	case float64:
-		if vFloat, ok := rawvalue.(float64); ok {
-			parsed = vFloat
-		} else {
-			if f, err := strconv.ParseFloat(fmt.Sprintf("%v", rawvalue), 64); err == nil {
-				parsed = f
-			} else {
-				parsed = defaultValue
-			}
-		}
-	default:
-		parsed = rawvalue
+	if v, ok := parse(raw, defaultValue); ok {
+		return v
 	}
-
-	preloadedVars[key] = parsed
-
-	return parsed.(T)
+	return defaultValue
 }
 
 func GetEnv(key string, defaultValue string) string {
@@ -255,6 +234,57 @@ func GetEnvFloat(key string, defaultValue float64) float64 {
 	return Get(key, defaultValue)
 }
 
+// lookup: primero el entorno (aunque esté vacío), luego los sources registrados,
+// luego los secretos de AWS.
+func lookup(key string) (any, bool) {
+	if v, ok := os.LookupEnv(key); ok {
+		return v, true
+	}
+
+	// Copia: no se ejecuta código de las fuentes con mu tomado.
+	mu.RLock()
+	ss := slices.Clone(sources)
+	mu.RUnlock()
+
+	for _, s := range ss {
+		if v, ok := s.Lookup(key); ok {
+			return v, true
+		}
+	}
+
+	return getAwsValue(key)
+}
+
+// parse convierte raw al tipo de def. Si no se puede, devuelve ok=false (nunca hace panic).
+func parse[T any](raw any, def T) (T, bool) {
+	s := fmt.Sprintf("%v", raw)
+	switch x := raw.(type) {
+	case float64: // JSON de AWS: evita "1e+06"
+		s = strconv.FormatFloat(x, 'f', -1, 64)
+	case map[string]any, []any: // JSON anidado: texto JSON, no "map[a:1]"
+		b, _ := json.Marshal(x)
+		s = string(b)
+	}
+
+	var out any
+	var err error
+	switch any(def).(type) {
+	case string:
+		out = s
+	case bool:
+		out, err = strconv.ParseBool(s)
+	case int:
+		out, err = strconv.Atoi(s)
+	case float64:
+		out, err = strconv.ParseFloat(s, 64)
+	default:
+		return def, false // shortcut: solo string/bool/int/float64, ampliar si hace falta
+	}
+
+	v, ok := out.(T)
+	return v, err == nil && ok
+}
+
 func getAwsValue(key string) (any, bool) {
 	mu.RLock()
 	defer mu.RUnlock()
@@ -264,7 +294,7 @@ func getAwsValue(key string) (any, bool) {
 	}
 
 	for _, awsSecret := range awsSecrets {
-		if awsValue, ok := awsSecret[key]; ok {
+		if awsValue, ok := awsSecret[key]; ok && awsValue != nil { // null = ausente
 			return awsValue, true
 		}
 	}
